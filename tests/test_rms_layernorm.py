@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Tests for FlashNorm-style weightless RMSNorm support.
+"""Tests for unsloth's fused RMSNorm Triton kernel.
 
 Covers:
-- weight=None (truly weightless modules)
-- weight=ones (HF convention for FlashNorm-folded checkpoints)
-- weight=randn (negative case — must NOT trigger the weightless path)
+- Correctness vs HF's LlamaRMSNorm reference, across shapes and dtypes.
+- FlashNorm-style weightless support:
+  - weight=None (truly weightless modules)
+  - weight=ones (HF convention for FlashNorm-folded checkpoints)
+  - weight=randn (negative case — must NOT trigger the weightless path)
+- Detection cache invalidation on weight mutation / reassignment.
+- load_state_dict regression for the weightless cache.
 """
 
 from __future__ import annotations
@@ -30,6 +34,44 @@ def _ref_rmsnorm(x: torch.Tensor, eps: float, weight = None) -> torch.Tensor:
     if weight is not None:
         y = y * weight.to(torch.float32)
     return y.to(x.dtype)
+
+
+@pytest.mark.parametrize("dim", [512, 1024, 2048])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("seqlen", [349, 2048, 3341])
+@pytest.mark.parametrize("random_state", [3407, 42])
+def test_rms_layernorm_matches_hf_reference(dim, dtype, seqlen, random_state):
+    """Lifted from the in-file `test_rms_layernorm` suite. Builds HF's
+    LlamaRMSNorm with a random-uniform weight, runs reference forward+backward,
+    runs unsloth's fast_rms_layernorm, and checks the input gradient matches.
+    """
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+
+    from unsloth.kernels.rms_layernorm import fast_rms_layernorm
+
+    eps = 1e-5
+    bsz = 21
+
+    layernorm = LlamaRMSNorm((dim,), eps = eps).to("cuda")
+    torch.cuda.manual_seed(random_state)
+    torch.manual_seed(random_state)
+    torch.nn.init.uniform_(layernorm.weight)
+
+    with torch.autocast(device_type = "cuda", dtype = dtype):
+        X = torch.randn((bsz, seqlen, dim), dtype = dtype, device = "cuda")
+        XX = X.clone()
+        X.requires_grad_(True)
+        XX.requires_grad_(True)
+        Y = layernorm(X)
+        YY = torch.randn(
+            (bsz, seqlen, dim), dtype = dtype, device = "cuda", requires_grad = True,
+        )
+        Y.backward(YY)
+        correct_grad = X.grad.clone()
+        Y2 = fast_rms_layernorm(layernorm, XX)
+        Y2.backward(YY)
+
+    assert torch.amax((correct_grad - XX.grad).abs()).item() <= 0.05
 
 
 @pytest.mark.parametrize("dim", [512, 1024, 4096])
