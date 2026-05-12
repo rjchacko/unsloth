@@ -285,18 +285,24 @@ def _is_weightless(layernorm) -> bool:
 
     Returns True when the layernorm has no weight, or when its weight is
     exactly all-ones (the convention HF uses to keep param shape on
-    FlashNorm-folded checkpoints). Caches the per-module result on first
-    call to avoid rescanning the weight every forward.
+    FlashNorm-folded checkpoints).
+
+    Caches the result keyed on `(weight.data_ptr(), weight._version)` so we
+    avoid rescanning on every forward, but re-scan after any operation that
+    changes the weight — including `load_state_dict` (in-place `copy_` bumps
+    `_version`), parameter reassignment, or `.data` swap (both change
+    `data_ptr`).
     """
     W = getattr(layernorm, "weight", None)
     if W is None:
         return True
+    key = (W.data_ptr(), W._version)
     cached = getattr(layernorm, "_unsloth_weightless", None)
-    if cached is not None:
-        return cached
-    cached = bool(torch.equal(W, torch.ones_like(W)))
-    layernorm._unsloth_weightless = cached
-    return cached
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    result = bool(torch.equal(W, torch.ones_like(W)))
+    layernorm._unsloth_weightless = (key, result)
+    return result
 
 
 # [TODO] Unsure why RMS Layernorm is not torch.compiling properly
@@ -440,9 +446,9 @@ def test_rms_layernorm_weightless(
         f"weightless backward mismatch in mode={mode}, dim={dim}, dtype={dtype}"
     )
 
-    # When mode='ones', the cache flag should be set after the first call.
+    # When mode='ones', detection should hit the cache on subsequent calls.
     if mode == "ones":
-        assert getattr(layernorm, "_unsloth_weightless", None) is True
+        assert _is_weightless(layernorm) is True
 
 
 def testing_suite_layernorm():
