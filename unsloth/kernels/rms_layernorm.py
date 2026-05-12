@@ -15,6 +15,7 @@
 import triton
 import triton.language as tl
 import torch
+from typing import Optional
 from .utils import calculate_settings, torch_gpu_device
 
 
@@ -172,7 +173,7 @@ def _gemma_rms_layernorm_forward(
 
 class Fast_RMS_Layernorm(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X: torch.Tensor, W, eps: float, gemma: bool = False):
+    def forward(ctx, X: torch.Tensor, W: Optional[torch.Tensor], eps: float, gemma: bool = False):
         shape = X.shape
         dim: int = shape[-1]
         X = X.reshape(-1, dim)
