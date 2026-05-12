@@ -75,6 +75,7 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from ..kernels import *
+from ..kernels.rms_layernorm import _is_weightless
 from ..tokenizer_utils import *
 from .vision import FastBaseModel
 
@@ -661,7 +662,8 @@ def fast_rms_layernorm_inference(self, X, XX = None, XX2 = None, variance = None
     else:
         X.copy_(XX)
 
-    X *= self.weight
+    if not _is_weightless(self):
+        X *= self.weight
     return X
 
 
