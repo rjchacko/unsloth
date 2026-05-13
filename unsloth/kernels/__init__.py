@@ -21,6 +21,7 @@ from .rms_layernorm import (
     fast_rms_layernorm,
     patch_rms_layernorm,
     unpatch_rms_layernorm,
+    _is_weightless,
 )
 from .layernorm import (
     fast_layernorm,

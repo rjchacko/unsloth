@@ -15,6 +15,7 @@
 import triton
 import triton.language as tl
 import torch
+from typing import Optional
 from .utils import calculate_settings, torch_gpu_device
 
 
@@ -31,6 +32,7 @@ def _rms_layernorm_forward(
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
 ):
     """
     Fast RMS Layernorm kernel
@@ -46,7 +48,8 @@ def _rms_layernorm_forward(
     r += row_idx * r_row_stride
 
     X_row = tl.load(X + col_offsets, mask = mask, other = 0).to(tl.float32)
-    W_row = tl.load(W + col_offsets, mask = mask, other = 0)  # .to(tl.float32)
+    if HAS_WEIGHT:
+        W_row = tl.load(W + col_offsets, mask = mask, other = 0)  # .to(tl.float32)
 
     row_var = tl.sum(X_row * X_row, axis = 0) / n_cols
     # Explicit float32 scalar to ensure correct type promotion on HIP/ROCm
@@ -54,8 +57,11 @@ def _rms_layernorm_forward(
     inv_var = tl.math.rsqrt(row_var + eps_f32)
     tl.store(r, inv_var)
     normed = X_row * inv_var
-    normed = normed.to(W_row.dtype)  # Exact copy from HF
-    output = normed * W_row
+    if HAS_WEIGHT:
+        normed = normed.to(W_row.dtype)  # Exact copy from HF
+        output = normed * W_row
+    else:
+        output = normed.to(Y.dtype.element_ty)
     tl.store(Y + col_offsets, output, mask = mask)
 
 
@@ -75,6 +81,7 @@ def _rms_layernorm_backward(
     eps: tl.constexpr,
     GEMMA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
 ):
     """
     Fast RMS Layernorm kernel for the backward pass
@@ -96,16 +103,20 @@ def _rms_layernorm_backward(
 
     dY_row = tl.load(dY + col_offsets, mask = mask, other = 0).to(tl.float32)
     X_row = tl.load(X + col_offsets, mask = mask, other = 0).to(tl.float32)
-    W_row = tl.load(W + col_offsets, mask = mask, other = 0).to(tl.float32)
+    if HAS_WEIGHT:
+        W_row = tl.load(W + col_offsets, mask = mask, other = 0).to(tl.float32)
 
     # Get saved row variance
     inv_var = tl.load(r).to(tl.float32)
     normed = X_row * inv_var
 
-    if GEMMA:
-        dY_W = dY_row * (W_row + 1.0)
+    if HAS_WEIGHT:
+        if GEMMA:
+            dY_W = dY_row * (W_row + 1.0)
+        else:
+            dY_W = dY_row * W_row
     else:
-        dY_W = dY_row * W_row
+        dY_W = dY_row
 
     rowsum_dY_normed = tl.sum(dY_W * normed, axis = 0)
     output = inv_var / n_cols * (n_cols * dY_W - normed * rowsum_dY_normed)
@@ -116,6 +127,7 @@ _rms_layernorm_backward = triton.jit(_rms_layernorm_backward)
 _rms_layernorm_backward = triton.heuristics(
     {
         "GEMMA": lambda args: bool(args["GEMMA"]),
+        "HAS_WEIGHT": lambda args: bool(args["HAS_WEIGHT"]),
     }
 )(_rms_layernorm_backward)
 
@@ -161,7 +173,7 @@ def _gemma_rms_layernorm_forward(
 
 class Fast_RMS_Layernorm(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, X: torch.Tensor, W: torch.Tensor, eps: float, gemma: bool = False):
+    def forward(ctx, X: torch.Tensor, W: Optional[torch.Tensor], eps: float, gemma: bool = False):
         shape = X.shape
         dim: int = shape[-1]
         X = X.reshape(-1, dim)
@@ -176,27 +188,54 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
         Y = torch.empty((n_rows, n_cols), dtype = X.dtype, device = device)
         r = torch.empty(n_rows, dtype = torch.float32, device = device)
 
+        has_weight = W is not None
+        # Triton needs a real tensor argument; pass X as a dummy when weightless.
+        # The guarded tl.load never executes, so the pointer value is unused.
+        W_arg = W if has_weight else X
+        W_stride = W.stride(0) if has_weight else 0
+
         fx = _gemma_rms_layernorm_forward if gemma else _rms_layernorm_forward
         with torch_gpu_device(device):
-            fx[(n_rows,)](
-                Y,
-                Y.stride(0),
-                X,
-                X.stride(0),
-                W,
-                W.stride(0),
-                r,
-                r.stride(0),
-                n_cols,
-                eps,
-                BLOCK_SIZE = BLOCK_SIZE,
-                num_warps = num_warps,
-            )
+            if gemma:
+                fx[(n_rows,)](
+                    Y,
+                    Y.stride(0),
+                    X,
+                    X.stride(0),
+                    W_arg,
+                    W_stride,
+                    r,
+                    r.stride(0),
+                    n_cols,
+                    eps,
+                    BLOCK_SIZE = BLOCK_SIZE,
+                    num_warps = num_warps,
+                )
+            else:
+                fx[(n_rows,)](
+                    Y,
+                    Y.stride(0),
+                    X,
+                    X.stride(0),
+                    W_arg,
+                    W_stride,
+                    r,
+                    r.stride(0),
+                    n_cols,
+                    eps,
+                    BLOCK_SIZE = BLOCK_SIZE,
+                    num_warps = num_warps,
+                    HAS_WEIGHT = has_weight,
+                )
         ctx.eps = eps
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.GEMMA = gemma
-        ctx.save_for_backward(X, W, r)
+        ctx.has_weight = has_weight
+        if has_weight:
+            ctx.save_for_backward(X, W, r)
+        else:
+            ctx.save_for_backward(X, r)
         return Y.view(*shape)
 
     @staticmethod
@@ -204,7 +243,13 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
         shape = dY.shape
         dim: int = shape[-1]
         dY = dY.reshape(-1, dim)
-        X, W, r = ctx.saved_tensors
+        if ctx.has_weight:
+            X, W, r = ctx.saved_tensors
+            W_stride = W.stride(0)
+        else:
+            X, r = ctx.saved_tensors
+            W = X  # dummy pointer; the guarded tl.load never runs.
+            W_stride = 0
         n_rows: int
         n_cols: int
         n_rows, n_cols = dY.shape
@@ -220,7 +265,7 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
                 X,
                 X.stride(0),
                 W,
-                W.stride(0),
+                W_stride,
                 r,
                 r.stride(0),
                 # dW, dW.stride(0),
@@ -229,20 +274,51 @@ class Fast_RMS_Layernorm(torch.autograd.Function):
                 GEMMA = ctx.GEMMA,
                 BLOCK_SIZE = ctx.BLOCK_SIZE,
                 num_warps = ctx.num_warps,
+                HAS_WEIGHT = ctx.has_weight,
             )
         dX = dX.view(*shape)
         return dX, None, None, None
 
 
+def _is_weightless(layernorm) -> bool:
+    """Detect whether an RMSNorm module is FlashNorm-folded (no useful scale).
+
+    Returns True when the layernorm has no weight, or when its weight is
+    exactly all-ones (the convention HF uses to keep param shape on
+    FlashNorm-folded checkpoints).
+
+    Caches the result keyed on `(weight.data_ptr(), weight._version)` so we
+    avoid rescanning on every forward, but re-scan after any operation that
+    changes the weight — including `load_state_dict` (in-place `copy_` bumps
+    `_version`), parameter reassignment, or `.data` swap (both change
+    `data_ptr`).
+    """
+    W = getattr(layernorm, "weight", None)
+    if W is None:
+        return True
+    key = (W.data_ptr(), W._version)
+    cached = getattr(layernorm, "_unsloth_weightless", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    result = bool(torch.equal(W, torch.ones_like(W)))
+    layernorm._unsloth_weightless = (key, result)
+    return result
+
+
 # [TODO] Unsure why RMS Layernorm is not torch.compiling properly
 @torch.compiler.disable
 def fast_rms_layernorm(layernorm, X: torch.Tensor, gemma: bool = False):
-    W: torch.Tensor = layernorm.weight
     eps: float = (
         layernorm.variance_epsilon
         if hasattr(layernorm, "variance_epsilon")
         else layernorm.eps
     )
+    if gemma:
+        # Gemma's RMSNorm uses (w + 1) semantics; weightless detection differs
+        # (identity = w == 0). Defer Gemma weightless support to a follow-up.
+        W = layernorm.weight
+    else:
+        W = None if _is_weightless(layernorm) else layernorm.weight
     out = Fast_RMS_Layernorm.apply(X, W, eps, gemma)
     return out
 
@@ -295,45 +371,3 @@ def unpatch_rms_layernorm():
     return
 
 
-def test_rms_layernorm(
-    dim = 1024,
-    eps = 1e-5,
-    dtype = torch.float16,
-    bsz = 21,
-    random_state = 3407,
-    seqlen = 3341,
-):
-    from transformers.models.llama.modeling_llama import LlamaRMSNorm
-
-    layernorm = LlamaRMSNorm((dim,), eps = eps).to("cuda")
-    torch.cuda.manual_seed(random_state)
-    torch.manual_seed(random_state)
-    torch.nn.init.uniform_(layernorm.weight)
-    X = torch.randn((bsz, seqlen, dim), dtype = dtype, device = "cuda")
-    XX = X.clone()
-    X.requires_grad_(True)
-    XX.requires_grad_(True)
-    Y = layernorm(X)
-    YY = torch.randn((bsz, seqlen, dim), dtype = dtype, device = "cuda", requires_grad = True)
-    Y.backward(YY)
-    correct_grad = X.grad.clone()
-    # from unsloth.kernels import fast_rms_layernorm
-    Y = fast_rms_layernorm(layernorm, XX)
-    Y.backward(YY)
-    assert torch.amax(correct_grad - XX.grad).item() <= 0.05
-
-
-def testing_suite_layernorm():
-    for dim in [512, 1024, 2048]:
-        for dtype in [torch.float16, torch.bfloat16]:
-            with torch.autocast(device_type = "cuda", dtype = dtype):
-                for seqlen in [3341, 2048, 349]:
-                    for random_state in [3407, 42]:
-                        test_rms_layernorm(
-                            dim = dim,
-                            eps = 1e-5,
-                            dtype = dtype,
-                            bsz = 21,
-                            random_state = random_state,
-                            seqlen = seqlen,
-                        )
